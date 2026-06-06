@@ -8,6 +8,9 @@ bin/
 # собранный бандл приложения (пересобирается через mac/app-src/build.sh)
 *.app/
 
+# артефакты сборки .NET (Windows exe пересобирается через dotnet publish)
+obj/
+
 # временные файлы
 *.tmp
 *.part

@@ -5,6 +5,9 @@ bin/
 # macOS
 .DS_Store
 
+# собранный бандл приложения (пересобирается через mac/app-src/build.sh)
+*.app/
+
 # временные файлы
 *.tmp
 *.part

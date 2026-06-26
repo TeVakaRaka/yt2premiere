@@ -43,7 +43,7 @@ jobs:
     needs: windows          # сериализуем публикацию в один релиз
     steps:
       - uses: actions/checkout@v4
-      - name: Build .app (universal: arm64 + x86_64)
+      - name: Build universal .app (arm64 + x86_64)
         run: bash mac/app-src/build.sh
       - name: Zip .app
         run: ditto -c -k --keepParent mac/yt2premiere.app yt2premiere-mac-app.zip

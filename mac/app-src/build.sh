@@ -29,6 +29,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-swiftc -O -o "$APP/Contents/MacOS/yt2premiere" "$DIR/YT2Premiere.swift"
+# Универсальный бинарник (Apple Silicon + Intel)
+swiftc -O -target arm64-apple-macosx11.0  -o "$APP/Contents/MacOS/yt2premiere-arm64" "$DIR/YT2Premiere.swift"
+swiftc -O -target x86_64-apple-macosx11.0 -o "$APP/Contents/MacOS/yt2premiere-x64"   "$DIR/YT2Premiere.swift"
+lipo -create -output "$APP/Contents/MacOS/yt2premiere" "$APP/Contents/MacOS/yt2premiere-arm64" "$APP/Contents/MacOS/yt2premiere-x64"
+rm -f "$APP/Contents/MacOS/yt2premiere-arm64" "$APP/Contents/MacOS/yt2premiere-x64"
 echo "✅ Готово: $APP"
 echo "Установить: cp -R \"$APP\" /Applications/"

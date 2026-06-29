@@ -68,6 +68,8 @@ namespace YT2Premiere
         static readonly string[] FMT_KEYS = { "mp4", "prores", "mp3" };
         static readonly string DefaultOut = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Videos", "YouTube");
+        // Флаги устойчивости к обрыву сети — в каждый вызов yt-dlp-загрузки (P0-3).
+        const string NetFlags = "--retries infinite --fragment-retries 50 --retry-sleep 3 --socket-timeout 30 --concurrent-fragments 4 -c ";
 
         TextBox urlBox, folderBox, logBox;
         ComboBox resBox, fmtBox;
@@ -269,18 +271,27 @@ namespace YT2Premiere
             string ff = Q(Tools.BinDir);
             if (it.Format == "mp3")
             {
-                string a = "-x --audio-format mp3 --audio-quality 0 --ffmpeg-location " + ff +
+                string a = NetFlags + "-x --audio-format mp3 --audio-quality 0 --ffmpeg-location " + ff +
                            " -o " + Q(Path.Combine(outDir, "%(title)s [%(id)s].%(ext)s")) + " " + Q(it.Url);
                 return Heal(a, log);
             }
-            string fmt = it.MaxRes > 0
-                ? "bv*[height<=" + it.MaxRes + "]+ba/b[height<=" + it.MaxRes + "]/bv*+ba/b"
-                : "bv*+ba/b";
+            // Для mp4 с заданным разрешением предпочитаем avc1(H.264)+m4a — тогда сработает
+            // ремукс без перекодирования. Для «Макс» и ProRes берём абсолютный best (P0-1).
+            bool preferAvc = it.Format == "mp4" && it.MaxRes > 0;
+            string fmt;
+            if (it.MaxRes > 0)
+            {
+                int n = it.MaxRes;
+                fmt = preferAvc
+                    ? "bv*[height<=" + n + "][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=" + n + "]+ba/b[height<=" + n + "]/bv*+ba/b"
+                    : "bv*[height<=" + n + "]+ba/b[height<=" + n + "]/bv*+ba/b";
+            }
+            else { fmt = "bv*+ba/b"; }
             string work = Path.Combine(Path.GetTempPath(), "yt2prem_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(work);
             try
             {
-                string dl = "-f " + Q(fmt) + " --merge-output-format mkv --ffmpeg-location " + ff +
+                string dl = NetFlags + "-f " + Q(fmt) + " --merge-output-format mkv --ffmpeg-location " + ff +
                             " -o " + Q(Path.Combine(work, "%(title)s [%(id)s].%(ext)s")) + " " + Q(it.Url);
                 if (!Heal(dl, log)) return false;
                 var files = Directory.GetFiles(work).Where(f =>
@@ -292,14 +303,14 @@ namespace YT2Premiere
             finally { try { Directory.Delete(work, true); } catch { } }
         }
 
-        int Probe(string src)
+        string FfprobeOut(string args)
         {
             try
             {
                 var psi = new ProcessStartInfo
                 {
                     FileName = Tools.Ffprobe,
-                    Arguments = "-v error -select_streams v:0 -show_entries stream=height -of csv=p=0 " + Q(src),
+                    Arguments = args,
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     CreateNoWindow = true,
@@ -308,11 +319,33 @@ namespace YT2Premiere
                 using (var p = Process.Start(psi))
                 {
                     string o = p.StandardOutput.ReadToEnd(); p.WaitForExit();
-                    string t = o.Split('\n')[0].Trim();
-                    int h; return int.TryParse(t, out h) ? h : 1080;
+                    return o;
                 }
             }
-            catch { return 1080; }
+            catch { return ""; }
+        }
+
+        // Кодек и высота видеопотока. При сбое — ("", 1080): уходим в перекодирование (безопасно).
+        (string codec, int height) ProbeVideo(string src)
+        {
+            string codec = ""; int height = 0;
+            string o = FfprobeOut("-v error -select_streams v:0 -show_entries stream=codec_name,height -of default=noprint_wrappers=1 " + Q(src));
+            foreach (var line in o.Split('\n'))
+            {
+                var kv = line.Split(new[] { '=' }, 2);
+                if (kv.Length != 2) continue;
+                string v = kv[1].Trim();
+                if (kv[0].Trim() == "codec_name") codec = v;
+                else if (kv[0].Trim() == "height") int.TryParse(v, out height);
+            }
+            return (codec, height == 0 ? 1080 : height);
+        }
+
+        // Кодек аудиопотока (aac/opus/…); "" если аудио нет.
+        string ProbeAudio(string src)
+        {
+            string o = FfprobeOut("-v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 " + Q(src));
+            return o.Split('\n')[0].Trim();
         }
 
         string Enc()
@@ -342,7 +375,7 @@ namespace YT2Premiere
 
         void Transcode(string src, string outDir, QueueItem it, Action<string> log)
         {
-            int h = Probe(src);
+            var (vcodec, h) = ProbeVideo(src);
             string bn = Path.GetFileNameWithoutExtension(src);
             if (it.Format == "prores")
             {
@@ -350,16 +383,27 @@ namespace YT2Premiere
                 log("ProRes 422 HQ (" + h + "p) → " + Path.GetFileName(o));
                 Run(Tools.Ffmpeg, "-y -hide_banner -loglevel warning -stats -i " + Q(src) +
                     " -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le -vendor apl0 -c:a pcm_s16le " + Q(o), log);
+                return;
             }
-            else
+            string outMp4 = Path.Combine(outDir, bn + ".mp4");
+            bool isH264 = vcodec == "h264" || vcodec == "avc1";
+            bool downscale = it.MaxRes > 0 && h > it.MaxRes;
+            // P0-1: источник уже H.264 нужного размера → ремукс без перекодирования (мгновенно, без потерь).
+            if (isH264 && !downscale)
             {
-                string vb = h >= 2160 ? "45M" : h >= 1440 ? "24M" : h >= 1080 ? "14M" : h >= 720 ? "8M" : "5M";
-                string venc = Enc();
-                string o = Path.Combine(outDir, bn + ".mp4");
-                log("MP4 H.264 / " + venc + " (" + h + "p, " + vb + ") → " + Path.GetFileName(o));
+                string acodec = ProbeAudio(src);
+                string aArgs = acodec == "aac" ? "-c:a copy" : "-c:a aac -b:a 320k";
+                log("Ремукс без перекодирования (H.264 " + h + "p) → " + Path.GetFileName(outMp4));
                 Run(Tools.Ffmpeg, "-y -hide_banner -loglevel warning -stats -i " + Q(src) +
-                    " -c:v " + venc + " -b:v " + vb + " -pix_fmt yuv420p -c:a aac -b:a 320k -movflags +faststart " + Q(o), log);
+                    " -map 0:v:0 -map 0:a:0? -c:v copy " + aArgs + " -movflags +faststart " + Q(outMp4), log);
+                return;
             }
+            // P0-2: перекодирование только для VP9/AV1 или downscale, со сниженной лестницей битрейта.
+            string vb = h >= 2160 ? "20M" : h >= 1440 ? "12M" : h >= 1080 ? "10M" : h >= 720 ? "5M" : "3M";
+            string venc = Enc();
+            log("Перекодирование MP4 H.264 / " + venc + " (" + h + "p, " + vb + ") → " + Path.GetFileName(outMp4));
+            Run(Tools.Ffmpeg, "-y -hide_banner -loglevel warning -stats -i " + Q(src) +
+                " -c:v " + venc + " -b:v " + vb + " -pix_fmt yuv420p -c:a aac -b:a 320k -movflags +faststart " + Q(outMp4), log);
         }
     }
 

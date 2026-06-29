@@ -7,6 +7,9 @@ let RES_VALUES = [0, 2160, 1440, 1080, 720, 480, 360]
 let FMT_TITLES = ["MP4 (H.264)", "ProRes (.mov)", "MP3 (звук)"]
 let FMT_KEYS   = ["mp4", "prores", "mp3"]
 let DEFAULT_OUT = (NSHomeDirectory() as NSString).appendingPathComponent("Movies/YouTube")
+// Флаги устойчивости к обрыву сети — добавляются в каждый вызов yt-dlp-загрузки (P0-3).
+let NET_FLAGS = ["--retries", "infinite", "--fragment-retries", "50", "--retry-sleep", "3",
+                 "--socket-timeout", "30", "--concurrent-fragments", "4", "-c"]
 
 // ───────────────────────────── инструменты ──────────────────────────────────
 final class Tools {
@@ -292,14 +295,25 @@ final class Controller: NSObject, NSTableViewDataSource {
         let ffDir = (Tools.ffmpeg as NSString).deletingLastPathComponent
         if it.format == "mp3" {
             let out = lastOut + "/%(title)s [%(id)s].%(ext)s"
-            return heal(["-x", "--audio-format", "mp3", "--audio-quality", "0", "--ffmpeg-location", ffDir, "-o", out, it.url])
+            return heal(NET_FLAGS + ["-x", "--audio-format", "mp3", "--audio-quality", "0", "--ffmpeg-location", ffDir, "-o", out, it.url])
         }
-        let fmt = it.maxRes > 0 ? "bv*[height<=\(it.maxRes)]+ba/b[height<=\(it.maxRes)]/bv*+ba/b" : "bv*+ba/b"
+        // Для mp4 с заданным разрешением предпочитаем avc1(H.264)+m4a — тогда сработает
+        // ремукс без перекодирования. Для «Макс» и ProRes берём абсолютный best (P0-1).
+        let preferAvc = it.format == "mp4" && it.maxRes > 0
+        let fmt: String
+        if it.maxRes > 0 {
+            let n = it.maxRes
+            fmt = preferAvc
+                ? "bv*[height<=\(n)][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=\(n)]+ba/b[height<=\(n)]/bv*+ba/b"
+                : "bv*[height<=\(n)]+ba/b[height<=\(n)]/bv*+ba/b"
+        } else {
+            fmt = "bv*+ba/b"
+        }
         let work = NSTemporaryDirectory() + "yt2prem_" + String(UUID().uuidString.prefix(8))
         try? FileManager.default.createDirectory(atPath: work, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: work) }
         let tmpl = work + "/%(title)s [%(id)s].%(ext)s"
-        if !heal(["-f", fmt, "--merge-output-format", "mkv", "--ffmpeg-location", ffDir, "-o", tmpl, it.url]) { return false }
+        if !heal(NET_FLAGS + ["-f", fmt, "--merge-output-format", "mkv", "--ffmpeg-location", ffDir, "-o", tmpl, it.url]) { return false }
         let files = ((try? FileManager.default.contentsOfDirectory(atPath: work)) ?? []).filter {
             $0.hasSuffix(".mkv") || $0.hasSuffix(".mp4") || $0.hasSuffix(".webm") || $0.hasSuffix(".mov")
         }
@@ -308,14 +322,35 @@ final class Controller: NSObject, NSTableViewDataSource {
         return true
     }
 
-    func probe(_ src: String) -> Int {
+    func ffprobeOut(_ args: [String]) -> String {
         let p = Process(); p.executableURL = URL(fileURLWithPath: Tools.ffprobe)
-        p.arguments = ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", src]
+        p.arguments = args
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
-        do { try p.run() } catch { return 1080 }
+        do { try p.run() } catch { return "" }
         let d = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
-        let s = (String(data: d, encoding: .utf8) ?? "").split(separator: "\n").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
-        return Int(s) ?? 1080
+        return String(data: d, encoding: .utf8) ?? ""
+    }
+
+    // Кодек и высота видеопотока. При сбое — ("", 1080): уходим в перекодирование (безопасно).
+    func probeVideo(_ src: String) -> (codec: String, height: Int) {
+        let out = ffprobeOut(["-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,height", "-of", "default=noprint_wrappers=1", src])
+        var codec = "", height = 0
+        for line in out.split(separator: "\n") {
+            let kv = line.split(separator: "=", maxSplits: 1).map(String.init)
+            guard kv.count == 2 else { continue }
+            let v = kv[1].trimmingCharacters(in: .whitespaces)
+            if kv[0] == "codec_name" { codec = v }
+            else if kv[0] == "height" { height = Int(v) ?? 0 }
+        }
+        return (codec, height == 0 ? 1080 : height)
+    }
+
+    // Кодек аудиопотока (aac/opus/…); "" если аудио нет.
+    func probeAudio(_ src: String) -> String {
+        return ffprobeOut(["-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", src])
+            .split(separator: "\n").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
     }
 
     func enc() -> String {
@@ -329,7 +364,7 @@ final class Controller: NSObject, NSTableViewDataSource {
     }
 
     func transcode(_ src: String, _ it: QueueItem) {
-        let h = probe(src)
+        let (vcodec, h) = probeVideo(src)
         let base = ((src as NSString).lastPathComponent as NSString).deletingPathExtension
         if it.format == "prores" {
             let out = lastOut + "/" + base + ".mov"
@@ -340,14 +375,26 @@ final class Controller: NSObject, NSTableViewDataSource {
                 _ = runTool(Tools.ffmpeg, ["-y", "-hide_banner", "-loglevel", "warning", "-stats", "-i", src,
                     "-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le", "-vendor", "apl0", "-c:a", "pcm_s16le", out])
             }
-        } else {
-            let vb = h >= 2160 ? "45M" : h >= 1440 ? "24M" : h >= 1080 ? "14M" : h >= 720 ? "8M" : "5M"
-            let venc = enc()
-            let out = lastOut + "/" + base + ".mp4"
-            ui { self.appendLog("MP4 H.264 / \(venc) (\(h)p, \(vb)) → \(base).mp4\n") }
-            _ = runTool(Tools.ffmpeg, ["-y", "-hide_banner", "-loglevel", "warning", "-stats", "-i", src,
-                "-c:v", venc, "-b:v", vb, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", out])
+            return
         }
+        let out = lastOut + "/" + base + ".mp4"
+        let isH264 = vcodec == "h264" || vcodec == "avc1"
+        let downscale = it.maxRes > 0 && h > it.maxRes
+        // P0-1: источник уже H.264 нужного размера → ремукс без перекодирования (мгновенно, без потерь).
+        if isH264 && !downscale {
+            let acodec = probeAudio(src)
+            let aArgs = (acodec == "aac") ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", "320k"]
+            ui { self.appendLog("Ремукс без перекодирования (H.264 \(h)p) → \(base).mp4\n") }
+            _ = runTool(Tools.ffmpeg, ["-y", "-hide_banner", "-loglevel", "warning", "-stats", "-i", src,
+                "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy"] + aArgs + ["-movflags", "+faststart", out])
+            return
+        }
+        // P0-2: перекодирование только для VP9/AV1 или downscale, со сниженной лестницей битрейта.
+        let vb = h >= 2160 ? "20M" : h >= 1440 ? "12M" : h >= 1080 ? "10M" : h >= 720 ? "5M" : "3M"
+        let venc = enc()
+        ui { self.appendLog("Перекодирование MP4 H.264 / \(venc) (\(h)p, \(vb)) → \(base).mp4\n") }
+        _ = runTool(Tools.ffmpeg, ["-y", "-hide_banner", "-loglevel", "warning", "-stats", "-i", src,
+            "-c:v", venc, "-b:v", vb, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", out])
     }
 
     // ——— разбор вывода ———
